@@ -1,0 +1,550 @@
+{
+  "name": "CodeBot - Dev-Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'event');"
+      },
+      "id": "55a01bd2-c7d9-4a50-8f7b-c9a5b41397d4",
+      "name": "Events only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3440,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'block');"
+      },
+      "id": "f9c22983-bfdc-49e7-9677-5c21009d5aa1",
+      "name": "Block only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3440,
+        16
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.CHAT_ID }}",
+        "text": "={{ String($json.text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "e69c60b4-98be-45d5-9d08-0b347e848d20",
+      "name": "Telegram: Info",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4112,
+        -176
+      ],
+      "webhookId": "6379e7f5-2b7e-43b9-8c5f-17427c96bc23",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "id": "d89c0ff6-d2c8-4a0a-9018-bc5acc78f088",
+      "name": "Daily at 7:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1648,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Values from the data table codebot_settings\nconst setting = (k, fallback) => {\n  const v = String($input.all().map(i => i.json).find(r => r.key === k)?.value ?? '').trim() || fallback;\n  if (!v) throw new Error(`${k} is missing in codebot_settings`);\n  return v;\n};\nconst timezone = setting('timezone');\nif (!DateTime.now().setZone(timezone).isValid) throw new Error(`timezone in codebot_settings is not a valid IANA time zone: ${timezone}`);\n// ==== ADJUST HERE ====\nreturn [{ json: {\n  CHAT_ID: setting('telegram_chat_id'),\n  CALENDAR_ID: setting('calendar_id'),   // the events are created here\n  TIMEZONE: timezone,\n\n  DEADLINE_DAYS: 45,                    // deadlines within this period go into the calendar\n\n  // The orchestrator starts tickets with this label at Claude (CodeBot - Start Claude Routine).\n  // The orchestrator ignores all other issues. CodeBot - Planning proposes planning sessions.\n  CCR_LABEL: setting('ready_label', 'ready-for-agent'),\n  MAX_CCR_PER_RUN: 3,                   // at most this many starts per run\n}}];"
+      },
+      "id": "7de4aef8-a61d-40eb-af21-855ce24ba16b",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1872,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendarId }}",
+          "mode": "id"
+        },
+        "returnAll": true,
+        "timeMin": "={{ $now.toISO() }}",
+        "timeMax": "={{ $now.plus({ days: $('Config').first().json.DEADLINE_DAYS + 1 }).toISO() }}",
+        "options": {
+          "fields": "*",
+          "orderBy": "startTime",
+          "recurringEventHandling": "expand",
+          "timeZone": "={{ $('Config').first().json.TIMEZONE }}"
+        }
+      },
+      "id": "068b72b8-1224-4392-9469-4f86053d88f9",
+      "name": "Calendar: Events",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        2320,
+        -80
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\nconst tz = cfg.TIMEZONE;\nconst now = DateTime.now().setZone(tz);\nconst events = $('Calendar: Events').all().map(i => i.json).filter(e => e.id && e.status !== 'cancelled');\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key);\n// Open issues of the repos in codebot_projects\nconst items = ($('GitHub').first().json.data?.search?.nodes || [])\n  .filter(c => c && c.number && c.__typename === 'Issue')\n  .map(c => ({ content: c }));\n\n// Open predecessors: native GitHub dependencies, or else a line \"Blocked by: #1, #2\" in the issue text\nconst openBlockers = (i, openSet) => {\n  const native = (i.blockedBy?.nodes || []).filter(b => b.state === 'OPEN').map(b => b.number);\n  const line = (String(i.body || '').match(/^\\s*Blocked by:\\s*(.+)$/im) || [])[1] || '';\n  const fromBody = [...line.matchAll(/#(\\d+)/g)].map(m => Number(m[1])).filter(n => openSet.has(n));\n  return [...new Set([...native, ...fromBody])];\n};\n// Open PRs per repo, recognised by the branch claude/issue-<N>-… (in addition to the link through \"Closes #N\")\nconst branchPrs = {};\nfor (const r of Object.values($('GitHub').first().json.data || {})) {\n  if (!r?.nameWithOwner) continue;\n  branchPrs[r.nameWithOwner.toLowerCase()] = new Set((r.pullRequests?.nodes || [])\n    .map(p => (String(p.headRefName || '').match(/^claude\\/issue-(\\d+)(?:-|$)/) || [])[1]).filter(Boolean).map(Number));\n}\nconst eventKey = e => (String(e.description || '').match(/codebot-key:\\s*(\\S+)/) || [])[1] || null;\nconst existingKeys = new Set(events.map(eventKey).filter(Boolean));\n\n// --- Projects from codebot_projects\nconst prioVal = { High: 3, Medium: 2, Low: 1 };\nconst projects = rows.map(r => ({\n  key: r.key, current: r.next_block || null, name: r.name,\n  repo: String(r.repo || '').trim().toLowerCase(), prio: r.priority || 'Medium', status: r.status,\n  deadline: /^\\d{4}-\\d{2}-\\d{2}/.test(String(r.deadline || '')) ? String(r.deadline) : null }));\nconst byRepo = Object.fromEntries(projects.filter(p => p.repo).map(p => [p.repo, p]));\nconst inactive = p => p && ['Paused', 'Done', 'Someday'].includes(p.status);\n\n// --- Candidates from the open issues\nconst ccr = [];\nconst openByRepo = {};\nfor (const it of items) (openByRepo[it.content.repository.nameWithOwner.toLowerCase()] ||= new Set()).add(it.content.number);\nfor (const it of items) {\n  const c = it.content;\n  if (!c || c.state !== 'OPEN' || !c.repository) continue;\n  const labels = (c.labels?.nodes || []).map(l => l.name);\n  const repo = c.repository.nameWithOwner;\n  const proj = byRepo[repo.toLowerCase()];\n  if (!proj || inactive(proj)) continue;\n  let score = prioVal[proj?.prio] || 1;\n  if (proj?.deadline && DateTime.fromISO(proj.deadline).diff(now, 'days').days < 14) score += 3;\n  if (labels.includes(cfg.CCR_LABEL)) {\n    // Ticket for Claude: start only without an open PR and without open predecessors\n    const hasPr = (c.closedByPullRequestsReferences?.nodes || []).some(p => p.state === 'OPEN')\n      || (branchPrs[repo.toLowerCase()] || new Set()).has(c.number);\n    const blocked = openBlockers(c, openByRepo[repo.toLowerCase()] || new Set()).length > 0;\n    if (!hasPr && !blocked) ccr.push({ repo, issue: c, score });\n    continue;\n  }\n  // Everything else (no label or a different one) is ignored.\n}\n\nconst out = [];\n\n// --- Deadlines from codebot_projects: all-day event + advance warning 3 days before\nconst allDay = (date, summary, description, key) => ({ json: {\n  kind: 'event', key,\n  label: `${date.setLocale('en').toFormat('ccc d LLL')} ${summary}`,\n  summary, description: `${description}\\ncodebot-key: ${key}`,\n  start: date.set({ hour: 12 }).toISO(), end: date.plus({ days: 1 }).set({ hour: 12 }).toISO(),\n  allday: 'yes', showMeAs: 'transparent',\n} });\nconst today = now.startOf('day');\nfor (const p of projects) {\n  if (!p.deadline || inactive(p)) continue;\n  const date = DateTime.fromISO(p.deadline, { zone: tz }).startOf('day');\n  const left = date.diff(today, 'days').days;\n  if (left < 0 || left > cfg.DEADLINE_DAYS) continue;\n  const key = `codebot-deadline:${p.key}:${date.toISODate()}`;\n  if (!existingKeys.has(key)) out.push(allDay(date, `⏰ Deadline: ${p.name}`, 'Deadline from the project list.', key));\n  const pre = date.minus({ days: 3 });\n  const preKey = `codebot-deadline-pre:${p.key}:${date.toISODate()}`;\n  if (pre >= today && !existingKeys.has(preKey))\n    out.push(allDay(pre, `⏰ In 3 days: deadline ${p.name}`, `Deadline on ${date.toFormat('yyyy-MM-dd')}.`, preKey));\n}\n// --- Write the next planning session per project (from the calendar, scheduled through CodeBot - Planning) back to codebot_projects\nconst next = {};\nconst addBlock = (key, iso) => {\n  const m = String(key || '').match(/^codebot-(?:issue|plan):([^#\\s]+)/);\n  const proj = m && byRepo[m[1].toLowerCase()];\n  if (!proj) return;\n  const d = DateTime.fromISO(iso).setZone(tz);\n  if (d <= now) return;\n  if (!next[proj.key] || d < next[proj.key].d) next[proj.key] = { d, proj };\n};\nfor (const e of events) if (e.start?.dateTime) addBlock(eventKey(e), e.start.dateTime);\nfor (const { d, proj } of Object.values(next)) {\n  const cur = proj.current ? DateTime.fromISO(proj.current).setZone(tz) : null;\n  if (cur && Math.abs(cur.diff(d, 'minutes').minutes) < 1) continue; // unchanged\n  out.push({ json: { kind: 'block', key: proj.key, date: d.toISO(), project: proj.name } });\n}\n// --- Jobs for Claude (the double-start guard lives in CodeBot - Start Claude Routine)\nfor (const w of ccr.sort((a, b) => b.score - a.score).slice(0, cfg.MAX_CCR_PER_RUN)) {\n  out.push({ json: { kind: 'ccr', repo: w.repo, issue_number: w.issue.number, title: w.issue.title,\n                     url: w.issue.url, body: w.issue.body || '', source: 'dev-orchestrator' } });\n}\nreturn out;"
+      },
+      "id": "0d52811a-1296-4543-9856-ff55f555dcbd",
+      "name": "Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3216,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.CALENDAR_ID }}",
+          "mode": "id"
+        },
+        "start": "={{ $json.start }}",
+        "end": "={{ $json.end }}",
+        "additionalFields": {
+          "allday": "={{ $json.allday }}",
+          "description": "={{ $json.description }}",
+          "showMeAs": "={{ $json.showMeAs }}",
+          "summary": "={{ $json.summary }}"
+        }
+      },
+      "id": "18688feb-14b9-46a7-8b78-95f4abfc3a9e",
+      "name": "Calendar: Create event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        3664,
+        -176
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const lines = $('Plan').all().filter(i => i.json.kind === 'event').map(i => '- ' + i.json.label);\nreturn [{ json: { text: `📅 New in the calendar:\\n${lines.join('\\n')}` } }];"
+      },
+      "id": "fb0cf517-c09d-43fa-9587-0c0f525592ac",
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3888,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "fc88a101-ae3c-4bc7-ae84-c145c020d8ac",
+      "name": "Projects",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2544,
+        -80
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Query GitHub only for the repos in codebot_projects (no account-wide search)\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key);\nconst repos = [...new Set(rows.map(r => String(r.repo || '').trim()).filter(r => /^[\\w.-]+\\/[\\w.-]+$/.test(r)))];\nif (!repos.length) return [{ json: { query: 'query { viewer { login } }', repos } }];\nconst repoParts = repos.map((r, i) => {\n  const [o, n] = r.split('/');\n  return `  r${i}: repository(owner: \"${o}\", name: \"${n}\") { nameWithOwner pushedAt pullRequests(states: OPEN, first: 50) { nodes { number headRefName } } }`;\n});\nconst q = `is:open is:issue archived:false ${repos.map(r => 'repo:' + r).join(' ')}`;\nconst query = `query {\n${repoParts.join('\\n')}\n  search(type: ISSUE, first: 100, query: \"${q}\") {\n    nodes {\n      ... on Issue { __typename number title url state body repository { nameWithOwner } labels(first: 10) { nodes { name } } blockedBy(first: 20) { nodes { number state } } closedByPullRequestsReferences(first: 5) { nodes { number state } } }\n    }\n  }\n}`;\nreturn [{ json: { query, repos } }];"
+      },
+      "id": "123f9c7d-bfe3-4b25-994e-b4da3ad637ab",
+      "name": "Build GitHub query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2768,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "={{ $json.query }}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "cf1c940d-98ce-4489-9930-0baea358c419",
+      "name": "GitHub",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        2992,
+        -80
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "key",
+              "condition": "eq",
+              "keyValue": "={{ $json.key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "next_block": "={{ $json.date }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "next_block",
+              "displayName": "next_block",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "82b197ae-4c52-4cdb-be03-3ae28b652210",
+      "name": "Next block",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3664,
+        16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'ccr');"
+      },
+      "id": "02b462cc-baf6-49ea-b6b4-0ee29e12ac50",
+      "name": "CCR only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3440,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "CodeBot - Start Claude Routine"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "2f46e3f3-b966-4e64-9e92-b3cfbdd215fc",
+      "name": "Start Claude Routine",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        3664,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The orchestrator reads only your own calendar: deadlines and planning sessions are there\nreturn [{ json: { calendarId: String($('Config').first().json.CALENDAR_ID ?? '').trim() } }];"
+      },
+      "id": "2dcee091-e11c-41c0-b5e5-739627d83d46",
+      "name": "Select calendars",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2096,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "name": "Settings",
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "bbc908d3-248f-421a-ba2c-ddbc085f5334",
+      "position": [
+        1872,
+        -256
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Events only": {
+      "main": [
+        [
+          {
+            "node": "Calendar: Create event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Select calendars",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar: Events": {
+      "main": [
+        [
+          {
+            "node": "Projects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan": {
+      "main": [
+        [
+          {
+            "node": "Events only",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Block only",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "CCR only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar: Create event": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summary": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Block only": {
+      "main": [
+        [
+          {
+            "node": "Next block",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects": {
+      "main": [
+        [
+          {
+            "node": "Build GitHub query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build GitHub query": {
+      "main": [
+        [
+          {
+            "node": "GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub": {
+      "main": [
+        [
+          {
+            "node": "Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CCR only": {
+      "main": [
+        [
+          {
+            "node": "Start Claude Routine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select calendars": {
+      "main": [
+        [
+          {
+            "node": "Calendar: Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily at 7:00": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "tags": []
+}

@@ -1,0 +1,780 @@
+{
+  "name": "CodeBot - /work (Telegram → Claude)",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Only this chat may give commands: telegram_chat_id in the data table codebot_settings\nconst ALLOWED_CHAT = String($input.all().map(i => i.json).find(r => r.key === 'telegram_chat_id')?.value ?? '').trim();\nif (!ALLOWED_CHAT) throw new Error('telegram_chat_id is missing in codebot_settings');\n// kind: list (/work)  |  command (/work <repo>)  |  pick (project button)  |  callback (yes/no)\n// Input: { route, update } from CodeBot - Telegram Router\nconst inp = $('From router').first().json;\nconst u = inp.update || inp;\nif (u.callback_query) {\n  const cq = u.callback_query;\n  const chat = String(cq.message?.chat?.id);\n  if (chat !== ALLOWED_CHAT) return [];\n  const data = String(cq.data || '');\n  let m = data.match(/^p\\|(.+)$/);\n  if (m) return [{ json: { kind: 'pick', chat_id: chat, query_id: cq.id, arg: m[1] } }];\n  m = data.match(/^w\\|([yn])\\|([^|]+)\\|(\\d+)$/);\n  if (m) return [{ json: { kind: 'callback', chat_id: chat, message_id: cq.message.message_id,\n                           query_id: cq.id, action: m[1], repo: m[2], number: Number(m[3]) } }];\n  return [];\n}\nconst msg = u.message;\nif (!msg?.text || String(msg.chat?.id) !== ALLOWED_CHAT) return [];\nconst m = msg.text.trim().match(/^\\/work(?:@\\w+)?(?:\\s+(\\S+))?/i);\nif (!m) return [];\nconst arg = m[1] || '';\nreturn [{ json: { kind: arg ? 'command' : 'list', chat_id: String(msg.chat.id), arg } }];"
+      },
+      "id": "5115c4e9-6603-4abd-8b11-eebf2c6859bf",
+      "name": "Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "6aaa47ff-88fa-4a58-970a-f73a47afff9b",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "list",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "list"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "084d3f92-5549-4380-95a8-2da769337c85",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "command",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "command"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "344fb5e3-f17d-4b91-a301-19b9c9ea97c5",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "pick",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pick"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "1db67f1f-edf2-4f17-b0a0-a42d7c2f72e9",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "callback",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "callback"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d4bc65b1-e961-42d9-b035-699570a863d6",
+      "name": "Which case?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -256,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==== ADJUST HERE ====\nconst SKIP_STATUS = ['Done', 'Paused', 'Someday'];          // don't offer these projects\n// =======================\nconst rank = { High: 0, Medium: 1, Low: 2 };\nconst projects = $input.all().map(i => i.json)\n  .filter(p => p.key && p.repo && !SKIP_STATUS.includes(p.status))\n  .map(p => ({ name: p.name || p.key, key: String(p.key), repo: String(p.repo).trim(), prio: p.priority || 'Medium' }))\n  .sort((a, b) => (rank[a.prio] ?? 1) - (rank[b.prio] ?? 1) || a.name.localeCompare(b.name, 'en'));\n\nconst bytes = s => new TextEncoder().encode(s).length;\nconst rows = [];\nfor (const p of projects) {\n  const data = `p|${p.key}`;                     // Telegram allows at most 64 bytes\n  if (bytes(data) > 64) continue;\n  rows.push([{ text: `${p.key} · ${p.name}`, callback_data: data }]);\n}\nconst payload = { chat_id: $('Router').first().json.chat_id,\n                  text: rows.length ? 'What should Claude work on?' : 'No active projects found in codebot_projects.' };\nif (rows.length) payload.reply_markup = { inline_keyboard: rows };\nreturn [{ json: { payload } }];"
+      },
+      "id": "9ad979ec-659e-4646-ab18-b133532bda4c",
+      "name": "Build project list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "callback",
+        "queryId": "={{ $json.query_id }}",
+        "additionalFields": {}
+      },
+      "id": "ebb0dce3-d768-4fad-8a64-4eea80892766",
+      "name": "Acknowledge selection",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        224
+      ],
+      "webhookId": "c11f1c9b-c651-4745-b64f-814fe20de998",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Resolve through codebot_projects: key, \"owner/repo\" or just \"repo\". Anything not in the list is not processed.\nconst arg = ($('Router').first().json.arg || '').trim();\nconst a = arg.toLowerCase();\nlet hit = null;\nfor (const p of $input.all().map(i => i.json)) {\n  const r = String(p.repo || '').trim();\n  if (!r || !p.key) continue;\n  if (String(p.key).toLowerCase() === a || r.toLowerCase() === a || r.toLowerCase().split('/')[1] === a) { hit = p; break; }\n}\nif (!hit) return [{ json: { repo: null, owner: '', name: '', project: null, arg } }];\nconst repo = String(hit.repo).trim();\nconst [owner, name] = repo.split('/');\nreturn [{ json: { repo, owner, name, project: hit.name, arg } }];"
+      },
+      "id": "6b5099d2-0287-473e-9b9d-79e36f7d8581",
+      "name": "Resolve repo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "=query {\n  repository(owner: \"{{ $json.owner }}\", name: \"{{ $json.name }}\") {\n    nameWithOwner\n    pullRequests(states: OPEN, first: 50) { nodes { number url headRefName } }\n    issues(first: 100, states: OPEN, orderBy: { field: CREATED_AT, direction: ASC }) {\n      nodes { number title url body createdAt labels(first: 10) { nodes { name } } subIssues(first: 1) { totalCount } parent { number } blockedBy(first: 20) { nodes { number state } } closedByPullRequestsReferences(first: 5) { nodes { number state url } } }\n    }\n  }\n}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "bc55248c-5dc8-40bc-b980-b4791a18f9e8",
+      "name": "GitHub: Oldest issues",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        672,
+        352
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only tickets with this label are work orders for Claude: ready_label in the data table codebot_settings\nconst READY_LABEL = String($('Settings').all().map(i => i.json).find(r => r.key === 'ready_label')?.value ?? '').trim() || 'ready-for-agent';\n// Open predecessors: native GitHub dependencies, or else a line \"Blocked by: #1, #2\" in the issue text\nconst openBlockers = (i, openSet) => {\n  const native = (i.blockedBy?.nodes || []).filter(b => b.state === 'OPEN').map(b => b.number);\n  const line = (String(i.body || '').match(/^\\s*Blocked by:\\s*(.+)$/im) || [])[1] || '';\n  const fromBody = [...line.matchAll(/#(\\d+)/g)].map(m => Number(m[1])).filter(n => openSet.has(n));\n  return [...new Set([...native, ...fromBody])];\n};\n// Parent issues are not work orders, even if they carry the label.\n// Recognised by sub-issues, or by an open issue naming them as its parent (natively or in the text).\nconst parentRef = i => {\n  if (i.parent?.number) return i.parent.number;\n  const b = String(i.body || '');\n  const m = b.match(/^##\\s*Parent\\s*\\n+[^\\n]*?#(\\d+)/im) || b.match(/^\\s*(?:Parent|Part of)\\b[^\\n#]*#(\\d+)/im);\n  return m ? Number(m[1]) : null;\n};\nconst r = $('Resolve repo').first().json;\nconst chat_id = $('Router').first().json.chat_id;\nif (!r.repo) return [{ json: { has_issue: false, text: `No project \"${r.arg}\" in codebot_projects. /work shows the list.` } }];\nconst repoData = $input.first().json.data?.repository;\nif (!repoData) return [{ json: { has_issue: false, text: `Repo \"${r.repo}\" not found (or no access).` } }];\nconst all = repoData.issues?.nodes || [];\nconst openSet = new Set(all.map(i => i.number));\nconst parents = new Set(all.map(parentRef).filter(Boolean));\nconst isParent = i => (i.subIssues?.totalCount || 0) > 0 || parents.has(i.number);\nconst ready = all.filter(i => (i.labels?.nodes || []).some(l => l.name === READY_LABEL) && !isParent(i));\n// Open PR for the ticket: linked (\"Closes #N\") or branch claude/issue-<N>-…; draft PRs count too\nconst branchPrs = new Set((repoData.pullRequests?.nodes || [])\n  .map(p => (String(p.headRefName || '').match(/^claude\\/issue-(\\d+)(?:-|$)/) || [])[1]).filter(Boolean).map(Number));\nconst hasOpenPr = i => branchPrs.has(i.number) || (i.closedByPullRequestsReferences?.nodes || []).some(p => p.state === 'OPEN');\nconst work = ready.filter(i => !hasOpenPr(i));\nconst inReview = ready.length - work.length;\nif (!ready.length) return [{ json: { has_issue: false,\n  text: `No tickets with the label ${READY_LABEL} in ${repoData.nameWithOwner}. A worker only starts tickets with this label.` } }];\nif (!work.length) return [{ json: { has_issue: false,\n  text: `All ${ready.length} tickets with the label ${READY_LABEL} in ${repoData.nameWithOwner} already have an open PR. Review and merge first:\\nhttps://github.com/${repoData.nameWithOwner}/pulls` } }];\n// Oldest issue whose predecessors are all closed\nconst idx = work.findIndex(i => !openBlockers(i, openSet).length);\nif (idx < 0) return [{ json: { has_issue: false,\n  text: `All ${work.length} tickets with the label ${READY_LABEL} in ${repoData.nameWithOwner} are waiting for open predecessors.` } }];\nconst i = work[idx];\nconst age = Math.floor((Date.now() - new Date(i.createdAt).getTime()) / 86400e3);\nconst body = (i.body || '').trim().slice(0, 600);\nconst labels = (i.labels?.nodes || []).map(l => l.name).join(', ');\nconst text = [\n  `🗂 ${repoData.nameWithOwner}`,\n  `Oldest startable ticket (${age} days old):`,\n  `#${i.number} ${i.title}`,\n  labels ? `Labels: ${labels}` : null,\n  idx ? `Skipped: ${idx} older ticket(s) with open predecessors` : null,\n  inReview ? `With an open PR, waiting for you: ${inReview}` : null,\n  i.url,\n  body ? `\\n${body}${(i.body || '').length > 600 ? ' […]' : ''}` : null,\n  '\\nLet Claude work on it?',\n].filter(Boolean).join('\\n');\nconst cb = a => `w|${a}|${repoData.nameWithOwner}|${i.number}`;\nreturn [{ json: { has_issue: true, text, payload: {\n  chat_id, text, link_preview_options: { is_disabled: true },\n  reply_markup: { inline_keyboard: [[\n    { text: '✅ Yes, start', callback_data: cb('y') },\n    { text: '❌ No', callback_data: cb('n') } ]] } } } }];"
+      },
+      "id": "78e0bb4c-f147-4110-9915-8524d344002f",
+      "name": "Oldest issue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "37082f7d-2ae0-4d47-b3ac-476a4dd93978",
+              "leftValue": "={{ $json.has_issue }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6bc94c01-c59a-4b1b-af0b-b50dc78cc87a",
+      "name": "Issue found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1104,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Router').first().json.chat_id }}",
+        "text": "={{ String($json.text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "58fc9f89-c507-488b-83d5-47bb01d2169e",
+      "name": "Telegram: Info",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1328,
+        480
+      ],
+      "webhookId": "c1b69231-653e-4bd9-8d4c-6c72f8b87437",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {}
+      },
+      "id": "7ea9ac12-d09f-4775-b459-210e6b1917a1",
+      "name": "Send to Telegram (API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1776,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "callback",
+        "queryId": "={{ $json.query_id }}",
+        "additionalFields": {}
+      },
+      "id": "d08f088c-d10f-40a3-b2ae-12a7d38899b2",
+      "name": "Acknowledge button",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        720
+      ],
+      "webhookId": "1b21d1f9-96b2-434d-b1bb-9fa75ed2a7b0",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "={{ $('Router').first().json.chat_id }}",
+        "messageId": "={{ $('Router').first().json.message_id }}",
+        "text": "={{ $('Router').first().json.action === 'y' ? '✅ Yes – starting Claude for ' : '❌ Cancelled: ' }}{{ $('Router').first().json.repo }}#{{ $('Router').first().json.number }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "419b8386-3685-4eb7-88d4-b34cded65223",
+      "name": "Update message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        224,
+        720
+      ],
+      "webhookId": "758f5ce1-f9c0-4bbf-869a-4457f866735b",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "0e8a44db-628a-4d0c-be24-c441d8a4554a",
+              "leftValue": "={{ $('Router').first().json.action === 'y' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "15723f94-51fb-474d-b826-c3379525761d",
+      "name": "Answer = yes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        448,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "=query {\n  repository(owner: \"{{ $('Router').first().json.repo.split('/')[0] }}\", name: \"{{ $('Router').first().json.repo.split('/')[1] }}\") {\n    issue(number: {{ $('Router').first().json.number }}) { number title url body state }\n  }\n}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "230ff518-9333-42f3-9fbd-5af33d85f096",
+      "name": "GitHub: Fetch issue",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        672,
+        672
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rp = $input.first().json.data?.repository;\nconst i = rp?.issue;\nif (!i) throw new Error('Issue not found');\nconst cb = $('Router').first().json;\nreturn [{ json: {\n  repo: cb.repo, issue_number: i.number, title: i.title, url: i.url, body: i.body || '',\n  source: 'telegram-work',\n  force: true,   // deliberate decision by button -> ignore the double-start guard\n} }];"
+      },
+      "id": "21d42e44-b005-40b5-a7bd-3d4ca46205a8",
+      "name": "Build contract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "CodeBot - Start Claude Routine"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "d21421df-8abf-40bf-a991-e9c80a40b5ec",
+      "name": "Start Claude Routine",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1104,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "25c534e8-e47f-4e63-8e85-f59cb7228094",
+      "name": "From router",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -704,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "f144b6d9-5ffe-4d8f-b440-1b3befdab6cd",
+      "name": "Projects: List",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "e437391d-2820-44d4-b8b5-e61bad8439e4",
+      "name": "Projects",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        224,
+        352
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "83c37a8f-f50d-438c-82ae-1e523d4dcf71",
+      "name": "Settings",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -480,
+        288
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// The bot token is in the data table codebot_settings (key telegram_bot_token), not in the workflow\nconst token = $('Settings').all().map(i => i.json).find(r => r.key === 'telegram_bot_token')?.value;\nif (!token) throw new Error('telegram_bot_token is missing in codebot_settings');\nconst src = $('Build project list').isExecuted ? $('Build project list') : $('Oldest issue');\nreturn [{ json: { url: `https://api.telegram.org/bot${String(token).trim()}/sendMessage`, payload: src.first().json.payload } }];"
+      },
+      "id": "c03219e5-4b9a-4a29-a235-519ba08b2c37",
+      "name": "Prepare send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        160
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Router": {
+      "main": [
+        [
+          {
+            "node": "Which case?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Which case?": {
+      "main": [
+        [
+          {
+            "node": "Projects: List",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Projects",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Acknowledge selection",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Acknowledge button",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acknowledge selection": {
+      "main": [
+        [
+          {
+            "node": "Projects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve repo": {
+      "main": [
+        [
+          {
+            "node": "GitHub: Oldest issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub: Oldest issues": {
+      "main": [
+        [
+          {
+            "node": "Oldest issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Oldest issue": {
+      "main": [
+        [
+          {
+            "node": "Issue found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Issue found?": {
+      "main": [
+        [
+          {
+            "node": "Prepare send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram: Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acknowledge button": {
+      "main": [
+        [
+          {
+            "node": "Update message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update message": {
+      "main": [
+        [
+          {
+            "node": "Answer = yes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer = yes?": {
+      "main": [
+        [
+          {
+            "node": "GitHub: Fetch issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub: Fetch issue": {
+      "main": [
+        [
+          {
+            "node": "Build contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build contract": {
+      "main": [
+        [
+          {
+            "node": "Start Claude Routine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects": {
+      "main": [
+        [
+          {
+            "node": "Resolve repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects: List": {
+      "main": [
+        [
+          {
+            "node": "Build project list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare send": {
+      "main": [
+        [
+          {
+            "node": "Send to Telegram (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From router": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build project list": {
+      "main": [
+        [
+          {
+            "node": "Prepare send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "saveDataSuccessExecution": "none"
+  },
+  "tags": []
+}

@@ -1,0 +1,498 @@
+{
+  "name": "CodeBot - Start Claude Routine",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "71cc5365-9bf7-409e-a8a9-9c0f58bece34",
+      "name": "Called by another workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -96,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Contract (input fields per item):\n//   repo (owner/name), issue_number, title   -> required\n//   url, body, extra, source                 -> optional\n//   force (true = ignore the double-start guard), dedup_hours (default 168)\n// Which worker starts is decided by the data table codebot_routines (the row with the matching repo).\nconst DEDUP_HOURS_DEFAULT = 168;\nconst sd = $getWorkflowStaticData('global');\nconst fired = sd.fired || {};\nconst out = [];\n$input.all().forEach((it, idx) => {\n  const j = it.json;\n  if (!j.repo || !j.issue_number) return;\n  const key = `${String(j.repo).toLowerCase()}#${j.issue_number}`;\n  const hours = j.dedup_hours ?? DEDUP_HOURS_DEFAULT;\n  const last = fired[key];\n  if (!j.force && last && (Date.now() - last) < hours * 3600e3) return; // already started\n  const lines = [\n    `Source: ${j.source || 'unknown'}`,\n    `Repo: ${j.repo}`,\n    `Issue #${j.issue_number}: ${j.title || ''}`,\n    j.url ? `URL: ${j.url}` : null,\n    j.extra ? `\\nExtra: ${j.extra}` : null,\n    j.body ? `\\n${j.body}` : '\\n(No issue text supplied - read the issue in the repo yourself.)',\n  ].filter(Boolean);\n  out.push({ json: { ...j, key, text: lines.join('\\n').slice(0, 60000) }, pairedItem: { item: idx } });\n});\nreturn out;"
+      },
+      "id": "55ab62bf-ec9a-465a-ac59-ef418e12e9ed",
+      "name": "Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        144,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ /^https?:\\/\\//i.test($json.fire_url) ? $json.fire_url : 'https://api.anthropic.com/v1/claude_code/routines/' + $json.fire_url + '/fire' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.token }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "experimental-cc-routine-2026-04-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}",
+        "options": {}
+      },
+      "id": "a4347a8b-62c3-4dad-8847-60a6f21d876a",
+      "name": "Routine API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        416
+      ],
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Remember after a successful start so the same job does not run twice\nconst prep = $('Assign worker').item.json;\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst head = `[${esc(prep.source || 'manual')}]\\n${esc(prep.repo)}#${prep.issue_number}: ${esc(prep.title)}`;\nconst url = $json.claude_code_session_url;\nif (!url) {\n  // Depending on its version, the HTTP node returns the error as text or as an object\n  const e = $json.error;\n  const err = (e && typeof e === 'object' ? (e.message || e.description || JSON.stringify(e)) : e) || $json.message || 'unknown error';\n  return { json: { ok: false, key: prep.key, repo: prep.repo, issue_number: prep.issue_number,\n                   info: `⚠️ Claude could not be started ${head}\\n${esc(String(err).slice(0, 300))}` } };\n}\nconst sd = $getWorkflowStaticData('global');\nsd.fired = sd.fired || {};\nsd.fired[prep.key] = Date.now();\nfor (const [k, t] of Object.entries(sd.fired)) {      // clean up entries older than 30 days\n  if (Date.now() - t > 30 * 24 * 3600e3) delete sd.fired[k];\n}\nreturn { json: {\n  ok: true, key: prep.key, source: prep.source || null,\n  repo: prep.repo, issue_number: prep.issue_number, title: prep.title,\n  session_url: url, started_at: new Date().toISOString(),\n  info: `🤖 Claude started ${head}\\n<a href=\"${url}\">Open session</a>`,\n} };"
+      },
+      "id": "165ac571-5867-4a33-84ee-f0849bc1efe7",
+      "name": "Remember",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Settings').all().find(i => i.json.key === 'telegram_chat_id')?.json.value }}",
+        "text": "={{ $json.info }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "d7c90ef7-b54e-403c-bfa7-bad5a935e54c",
+      "name": "Telegram: Started",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1488,
+        320
+      ],
+      "webhookId": "a253863d-3f8c-402b-93f8-42fbd1585f5a",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_routines"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "aab33653-f6aa-44d0-be33-449c48e9d81a",
+      "name": "Routines",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        368,
+        512
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// One worker (CCR routine) per project: fire_url and token are in codebot_routines\nconst rows = $input.all().map(i => i.json).filter(r => r.repo);\nreturn $('Prepare').all().map(it => {\n  const j = it.json;\n  const r = rows.find(x => String(x.repo).trim().toLowerCase() === String(j.repo).toLowerCase() && x.active !== false);\n  const ok = !!(r && r.fire_url && r.token);\n  return { json: { ...j, worker: ok, fire_url: ok ? String(r.fire_url).trim() : null, token: ok ? String(r.token).trim() : null } };\n});"
+      },
+      "id": "a40db69b-1a0a-43d7-9e56-1b00c2fb5bcc",
+      "name": "Assign worker",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ee3ed8f8-1a8a-4949-956d-2ecd456d3e3c",
+              "leftValue": "={{ $json.worker }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5ef5af7c-065d-4b4f-a700-16fd3333b65c",
+      "name": "Worker exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        816,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Settings').all().find(i => i.json.key === 'telegram_chat_id')?.json.value }}",
+        "text": "=⚠️ No worker set up for {{ String($json.repo).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}.\nIssue #{{ $json.issue_number }} was not started. Create the routine, generate an API token and fill in the row in codebot_routines (see SETUP.md, step 7).",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "b76941e0-0539-4180-9ef9-1bf347cabd27",
+      "name": "Telegram: No worker",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        704
+      ],
+      "webhookId": "2c6f001d-d25a-4053-8ce1-9b8989d4a600",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "664e489e-69fa-427e-aad1-878ba81401d3",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ab8e68f1-f370-41ed-a305-0919e530cd52",
+      "name": "Started?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1488,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 90,
+        "unit": "minutes"
+      },
+      "id": "fa206858-f4b0-4690-9cb7-d7fdc1e32f3e",
+      "name": "Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1712,
+        512
+      ],
+      "webhookId": "f1bcfae8-2ab9-4762-8c22-540efd0fb0ab"
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "=query {\n  repository(owner: \"{{ $json.repo.split('/')[0] }}\", name: \"{{ $json.repo.split('/')[1] }}\") {\n    pullRequests(first: 30, orderBy: { field: CREATED_AT, direction: DESC }) {\n      nodes { number title url isDraft state createdAt headRefName body closingIssuesReferences(first: 10) { nodes { number } } }\n    }\n  }\n}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "042682c1-d8c3-4015-becc-e8c72f01955b",
+      "name": "GitHub: Find PR",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        1936,
+        512
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Find the PR for the issue: branch claude/issue-<N>-…, a linked issue, or \"Closes #N\" in the text\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst metas = $('Wait').all().map(i => i.json);\nreturn $input.all().map((it, idx) => {\n  const m = metas[idx];\n  const n = m.issue_number;\n  const since = new Date(m.started_at).getTime() - 5 * 60e3;\n  const closes = new RegExp(`(close[sd]?|fix(e[sd])?|resolve[sd]?)\\\\s+#${n}\\\\b`, 'i');\n  const branch = new RegExp(`^claude/issue-${n}(\\\\D|$)`);\n  const prs = it.json.data?.repository?.pullRequests?.nodes;\n  const head = `${esc(m.repo)}#${n}: ${esc(m.title)}`;\n  const session = `<a href=\"${m.session_url}\">Open session</a>`;\n  if (!prs) return { json: { text: `⚠️ PR check for ${head} failed (GitHub unreachable).\\n${session}` } };\n  const pr = prs.find(p => new Date(p.createdAt).getTime() >= since && (\n    branch.test(p.headRefName || '') ||\n    (p.closingIssuesReferences?.nodes || []).some(x => x.number === n) ||\n    closes.test(p.body || '')));\n  if (!pr) return { json: { text: `⚠️ No PR for ${head}\\nAfter 90 minutes there is no matching pull request.\\n${session}` } };\n  const state = pr.state === 'MERGED' ? 'merged' : pr.state === 'CLOSED' ? 'closed' : pr.isDraft ? 'draft, not finished yet' : 'ready for review';\n  const gaps = String(pr.body || '').split(/\\n(?=#{1,6}\\s)/).find(s => /^#{1,6}\\s*Gaps in the issue/i.test(s));\n  const gapText = gaps ? gaps.replace(/^#{1,6}[^\\n]*\\n?/, '').trim().slice(0, 600) : '';\n  return { json: { text: [\n    `${pr.isDraft ? '📝' : '✅'} PR for ${head}`,\n    `Status: ${state}`,\n    `<a href=\"${pr.url}\">PR #${pr.number}: ${esc(pr.title)}</a>`,\n    gapText && !/^(none|-|–)\\.?$/i.test(gapText) ? `\\nGaps in the issue:\\n${esc(gapText)}` : null,\n  ].filter(Boolean).join('\\n') } };\n});"
+      },
+      "id": "24032203-3091-4e49-9980-3cde00d10c43",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Settings').all().find(i => i.json.key === 'telegram_chat_id')?.json.value }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "b54d3bf1-c41a-4848-8fee-53345dc67953",
+      "name": "Telegram: Result",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2384,
+        512
+      ],
+      "webhookId": "16045d5b-ab8f-4703-b5e1-6bb668290970",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "name": "Settings",
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "80f2d7a1-1ee8-4016-8ed7-339f27778c9c",
+      "position": [
+        368,
+        336
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Called by another workflow": {
+      "main": [
+        [
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routine API": {
+      "main": [
+        [
+          {
+            "node": "Remember",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remember": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Started",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Started?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routines": {
+      "main": [
+        [
+          {
+            "node": "Assign worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign worker": {
+      "main": [
+        [
+          {
+            "node": "Worker exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worker exists?": {
+      "main": [
+        [
+          {
+            "node": "Routine API",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram: No worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Started?": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "GitHub: Find PR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub: Find PR": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Routines",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "saveDataSuccessExecution": "none"
+  },
+  "tags": []
+}

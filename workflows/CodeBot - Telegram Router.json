@@ -1,0 +1,363 @@
+{
+  "name": "CodeBot - Telegram Router",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "8e776466-cd09-4767-9975-70da97ed9bda",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "465dff0c-717f-4f1d-841a-72b9c3b8868c",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only this chat is served: telegram_chat_id in the data table codebot_settings\nconst ALLOWED_CHAT = String($input.all().map(i => i.json).find(r => r.key === 'telegram_chat_id')?.value ?? '').trim();\nif (!ALLOWED_CHAT) throw new Error('telegram_chat_id is missing in codebot_settings');\n// The bot's only Telegram trigger. Dispatches to: work | plan | connect | chat\n// Callback prefixes: p| and w| belong to CodeBot - /work, s| belongs to CodeBot - Planning. New workflows with buttons reserve their prefix here.\nconst u = $('Telegram Trigger').first().json;\nconst cq = u.callback_query;\nconst msg = u.message;\n// A discarded update leaves as route 'ignored' with the reason. No output of \"Where to?\" takes it, so the execution ends there and shows why.\nconst ignore = reason => [{ json: { route: 'ignored', reason } }];\nif (!cq && !msg) return ignore('update without a message or a button');\nconst chat = String(cq ? cq.message?.chat?.id : msg.chat?.id);\nif (chat !== ALLOWED_CHAT) return ignore(`chat ${chat} is not telegram_chat_id (${ALLOWED_CHAT}) in codebot_settings`);\n\nlet route = 'chat';\nif (cq) {\n  const data = String(cq.data || '');\n  if (/^[pw]\\|/.test(data)) route = 'work';\n  else if (/^s\\|/.test(data)) route = 'plan';\n  else return ignore(`button with an unknown prefix: ${data.slice(0, 20)}`);\n} else {\n  const t = String(msg.text || msg.caption || '').trim();\n  if (/^\\/work(@\\w+)?(\\s|$)/i.test(t)) route = 'work';\n  else if (/^\\/plan(@\\w+)?(\\s|$)/i.test(t)) route = 'plan';\n  // /connect <owner/repo|url>; \"connect <repo-url>\" without the slash works too\n  else if (/^\\/connect(@\\w+)?(\\s|$)/i.test(t) || /^connect\\s+(https?:\\/\\/)?(www\\.)?github\\.com\\/\\S+$/i.test(t)) route = 'connect';\n}\nreturn [{ json: { route, update: u } }];"
+      },
+      "id": "51d07853-49af-4d8a-8a61-c3760f8237a6",
+      "name": "Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "397f72bd-2fb5-4c33-ad87-c1fd903fab32",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "work",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "work"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "558cf641-7941-4f72-95b1-44d58f27769e",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "plan",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "plan"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "9cdae1ff-a2cd-4cea-a0a5-942c96d0d25b",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "connect",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "connect"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "71fcad98-a2b6-4cb8-984e-80f0899d755a",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "chat",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "chat"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "7f70d1db-c6b5-413c-a46b-1d3402a83cf8",
+      "name": "Where to?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        448,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "CodeBot - /work (Telegram → Claude)"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "9168d762-7e3e-42b5-8157-daf3bff61c14",
+      "name": "→ CodeBot - /work",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        704,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "CodeBot - Connect Repo"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "f0d29926-8e4e-47ba-a7fe-263f20118979",
+      "name": "→ CodeBot - Connect Repo",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        704,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "CodeBot - Chat"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "55e91999-d77b-4c99-8c6b-0bbdd551ec04",
+      "name": "→ CodeBot - Chat",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        704,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "CodeBot - Planning"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "8b8ad468-cdd0-4c86-8610-85eda875fe18",
+      "name": "→ CodeBot - Planning",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        704,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "name": "Settings",
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "2b9bfb45-07eb-4eaf-86fd-72cc40bbcc94",
+      "position": [
+        224,
+        -176
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Where to?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Where to?": {
+      "main": [
+        [
+          {
+            "node": "→ CodeBot - /work",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "→ CodeBot - Planning",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "→ CodeBot - Connect Repo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "→ CodeBot - Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

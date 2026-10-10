@@ -1,0 +1,392 @@
+{
+  "name": "CodeBot - Signal Sweep",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "9492dbeb-e8d3-4313-963c-684a089f6c03",
+      "name": "Hourly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Values from the data table codebot_settings\nconst setting = (k, fallback) => {\n  const v = String($input.all().map(i => i.json).find(r => r.key === k)?.value ?? '').trim() || fallback;\n  if (!v) throw new Error(`${k} is missing in codebot_settings`);\n  return v;\n};\nconst timezone = setting('timezone');\nif (!DateTime.now().setZone(timezone).isValid) throw new Error(`timezone in codebot_settings is not a valid IANA time zone: ${timezone}`);\n// ==== ADJUST HERE ====\nreturn [{ json: {\n  CHAT_ID: setting('telegram_chat_id'),\n  TIMEZONE: timezone,\n\n  THRESHOLD: 3,                          // ask from this score upwards\n  MIN_HOURS_BETWEEN_PINGS: 18,           // at most one question within this period\n  NEXT_BLOCK_SKIP_DAYS: 5,               // don't nudge projects that have a block within the next X days\n\n  // When may it ask? (hours, end exclusive)\n  WEEKDAY_FROM: 18, WEEKDAY_TO: 22,\n  WEEKEND_FROM: 9,  WEEKEND_TO: 21,\n}}];"
+      },
+      "id": "1fadc72c-e9a9-4cb4-a894-976b362471ff",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\nconst now = DateTime.now().setZone(cfg.TIMEZONE);\nconst weekend = now.weekday >= 6;\nconst [from, to] = weekend ? [cfg.WEEKEND_FROM, cfg.WEEKEND_TO] : [cfg.WEEKDAY_FROM, cfg.WEEKDAY_TO];\nreturn now.hour >= from && now.hour < to ? $input.all() : [];"
+      },
+      "id": "498d0ba2-c274-4a12-b227-0620db29ac05",
+      "name": "Time window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\nconst tz = cfg.TIMEZONE;\nconst now = DateTime.now().setZone(tz);\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key);\n// Read the GitHub response: r0, r1, … = repos (last push), search = open issues and PRs\nconst gh = $('GitHub').first().json.data || null;\nconst pushed = {};\nfor (const [k, v] of Object.entries(gh || {})) if (/^r\\d+$/.test(k) && v) pushed[v.nameWithOwner.toLowerCase()] = DateTime.fromISO(v.pushedAt);\nconst date = s => { const dt = s ? DateTime.fromISO(String(s), { zone: tz }) : null; return dt && dt.isValid ? dt : null; };\nconst days = dt => dt ? now.diff(dt, 'days').days : null;\n\nconst openByRepo = {};\nfor (const i of gh?.search?.nodes || []) {\n  if (!i?.repository) continue;\n  (openByRepo[i.repository.nameWithOwner.toLowerCase()] ||= []).push({\n    number: i.number, title: i.title, pr: i.__typename === 'PullRequest', updated: i.updatedAt,\n    labels: (i.labels?.nodes || []).map(l => l.name) });\n}\n\nconst projects = rows.map(r => ({\n  name: r.name, key: r.key, status: r.status, group: r.group || null, prio: r.priority || 'Medium',\n  repo: String(r.repo || '').trim().toLowerCase(), quiet_days: r.quiet_days ?? null, deadline: date(r.deadline),\n  waitingFor: r.waiting_for || '', waitingSince: date(r.waiting_since),\n  nextStep: r.next_step || '', description: r.description || '',\n  checkin: date(r.last_checkin), ping: date(r.last_ping), block: date(r.next_block),\n})).filter(p => !['Done', 'Paused'].includes(p.status));\n\n// Global brake: at most one question per MIN_HOURS_BETWEEN_PINGS\nconst lastPing = projects.map(p => p.ping).filter(Boolean).sort((a, b) => b - a)[0];\nif (lastPing && now.diff(lastPing, 'hours').hours < cfg.MIN_HOURS_BETWEEN_PINGS) return [];\n\nconst prioFactor = { High: 1.5, Medium: 1, Low: 0.7 };\nconst scored = [];\n\nfor (const p of projects) {\n  const someday = p.status === 'Someday';\n  const quiet = p.quiet_days || (someday ? 30 : 7);\n  if (p.ping && days(p.ping) < quiet / 2) continue;                          // not the same project too often\n  if (p.block && p.block > now && p.block.diff(now, 'days').days <= cfg.NEXT_BLOCK_SKIP_DAYS) continue; // work is already scheduled\n\n  const reasons = [];\n  let score = 0;\n  const act = [pushed[p.repo], p.checkin].filter(Boolean).sort((a, b) => b - a)[0] || null;\n  const quietDays = act ? days(act) : quiet * 2;\n  if (quietDays > quiet) {\n    score += 2 + (quietDays - quiet) / quiet;\n    reasons.push(act ? `no activity for ${Math.round(quietDays)} days` : 'never had a check-in or commit');\n  }\n  if (p.status === 'Waiting' && p.waitingSince && days(p.waitingSince) > 5) {\n    score += 2; reasons.push(`waiting for ${Math.round(days(p.waitingSince))} days on: ${p.waitingFor || 'unknown'}`);\n  }\n  if (p.deadline && !someday) {\n    const left = -days(p.deadline);\n    if (left < 0) { score += 3; reasons.push('deadline passed'); }\n    else if (left < 14) { score += 1 + (14 - left) / 4; reasons.push(`deadline in ${Math.round(left)} days`); }\n  }\n  const open = openByRepo[p.repo] || [];\n  const stalePRs = open.filter(i => i.pr && days(DateTime.fromISO(i.updated)) > 5);\n  if (stalePRs.length) { score += 1; reasons.push(`${stalePRs.length} PR(s) without movement`); }\n\n  score *= prioFactor[p.prio] || 1;\n  score *= 0.8 + Math.random() * 0.4; // a bit of randomness\n  if (score >= cfg.THRESHOLD) scored.push({ ...p, score: Math.round(score * 10) / 10, reasons, open: open.slice(0, 10) });\n}\n\nif (!scored.length) return [];\nscored.sort((a, b) => b.score - a.score);\nconst t = scored[0];\nconst iso = dt => dt ? dt.toISODate() : null;\nreturn [{ json: { ...t, deadline: iso(t.deadline), waitingSince: iso(t.waitingSince), checkin: iso(t.checkin),\n                  ping: iso(t.ping), block: iso(t.block) } }];"
+      },
+      "id": "28136ce4-d18e-49b8-a5d4-805fdb6f757a",
+      "name": "Scoring",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are my personal project manager. I am a software developer and look after several software projects.\n\nWrite ONE short, specific question about the following project: at most 3 sentences, in English, informal, no greeting, no Markdown. Refer to the specific reason and the last known state. No reproach; be curious and helpful instead.\nIf the status is \"Someday\", don't ask about progress; ask whether I want to activate the project in the coming weeks or keep it parked.\n\nProject: {{ $json.name }}\nDescription: {{ $json.description || '-' }}\nStatus: {{ $json.status }} | Priority: {{ $json.prio }} | Group: {{ $json.group || '-' }}\nReason: {{ $json.reasons.join('; ') }}\nNext step on file: {{ $json.nextStep || '-' }}\nWaiting for: {{ $json.waitingFor || '-' }}\nOpen issues and PRs:\n{{ $json.open.map(i => (i.number ? '#' + i.number + ' ' : '') + (i.pr ? '(PR) ' : '') + i.title + (i.labels?.length ? ' [' + i.labels.join(', ') + ']' : '')).join('\\n') || 'none' }}\n\nReply with the message itself only."
+      },
+      "id": "d9cba501-2259-4af2-bbd2-f77f4b4956cb",
+      "name": "Phrase question",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {}
+      },
+      "id": "b0f621eb-8a39-47eb-b8d7-9ee57096bc79",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        520
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "GEMINI_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.CHAT_ID }}",
+        "text": "={{ ('[' + $('Scoring').first().json.key + '] ' + $json.text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "2cfe7efd-0f3b-4515-8e15-36332c3d9112",
+      "name": "Telegram: Question",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1780,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "82098c93-d9f1-44fd-bf1b-9179e4ff2dc7",
+      "name": "Projects",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        300
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Query GitHub only for the repos in codebot_projects (no account-wide search)\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key);\nconst repos = [...new Set(rows.map(r => String(r.repo || '').trim()).filter(r => /^[\\w.-]+\\/[\\w.-]+$/.test(r)))];\nif (!repos.length) return [{ json: { query: 'query { viewer { login } }', repos } }];\nconst repoParts = repos.map((r, i) => {\n  const [o, n] = r.split('/');\n  return `  r${i}: repository(owner: \"${o}\", name: \"${n}\") { nameWithOwner pushedAt }`;\n});\nconst q = `is:open archived:false ${repos.map(r => 'repo:' + r).join(' ')}`;\nconst query = `query {\n${repoParts.join('\\n')}\n  search(type: ISSUE, first: 100, query: \"${q}\") {\n    nodes {\n      ... on Issue { __typename number title updatedAt repository { nameWithOwner } labels(first: 10) { nodes { name } } }\n      ... on PullRequest { __typename number title url updatedAt repository { nameWithOwner } }\n    }\n  }\n}`;\nreturn [{ json: { query, repos } }];"
+      },
+      "id": "9edee7b4-334a-42a5-a290-9c7c0fe80759",
+      "name": "Build GitHub query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "={{ $json.query }}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "0db1ab30-394f-49c7-8ba3-558db8633337",
+      "name": "GitHub",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "key",
+              "condition": "eq",
+              "keyValue": "={{ $('Scoring').first().json.key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "last_ping": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "last_ping",
+              "displayName": "last_ping",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "3f7d02a0-1e0e-484b-aa7e-0bc87a73c206",
+      "name": "Last ping",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "name": "Settings",
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "96f03259-248f-4047-b806-30033af05006",
+      "position": [
+        220,
+        124
+      ]
+    }
+  ],
+  "connections": {
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Time window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Time window": {
+      "main": [
+        [
+          {
+            "node": "Projects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scoring": {
+      "main": [
+        [
+          {
+            "node": "Phrase question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Phrase question": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram: Question": {
+      "main": [
+        [
+          {
+            "node": "Last ping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Phrase question",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects": {
+      "main": [
+        [
+          {
+            "node": "Build GitHub query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build GitHub query": {
+      "main": [
+        [
+          {
+            "node": "GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub": {
+      "main": [
+        [
+          {
+            "node": "Scoring",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hourly": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,510 @@
+{
+  "name": "CodeBot - Chat",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Values from the data table codebot_settings\nconst setting = (k, fallback) => {\n  const v = String($input.all().map(i => i.json).find(r => r.key === k)?.value ?? '').trim() || fallback;\n  if (!v) throw new Error(`${k} is missing in codebot_settings`);\n  return v;\n};\nconst timezone = setting('timezone');\nif (!DateTime.now().setZone(timezone).isValid) throw new Error(`timezone in codebot_settings is not a valid IANA time zone: ${timezone}`);\nreturn [{ json: {\n  CHAT_ID: setting('telegram_chat_id'),\n  TIMEZONE: timezone,\n}}];"
+      },
+      "id": "c1f3321e-3e40-46ba-be9a-88fa46b190dc",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: { route, update } from CodeBot - Telegram Router. Only text messages from your chat.\nconst cfg = $('Config').first().json;\nconst inp = $('From router').first().json;\nconst msg = (inp.update || inp).message;\nif (!msg || String(msg.chat.id) !== String(cfg.CHAT_ID) || !msg.text) return [];\nconst replyTo = msg.reply_to_message?.text || '';\nconst m = replyTo.match(/^\\[([^\\]]+)\\]/) || msg.text.match(/^\\[([^\\]]+)\\]/);\nreturn [{ json: { text: msg.text, replyTo, tag: m ? m[1] : null, chatId: msg.chat.id } }];"
+      },
+      "id": "5082acfd-6bde-41a7-8d66-261f1c70614e",
+      "name": "Only me",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        816,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const tz = $('Config').first().json.TIMEZONE;\nconst now = DateTime.now().setZone(tz);\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key && r.status !== 'Done');\n// Read the GitHub response: r0, r1, … = repos (last push), search = open issues and PRs\nconst gh = $('GitHub').first().json.data || null;\nconst pushed = {};\nfor (const [k, v] of Object.entries(gh || {})) if (/^r\\d+$/.test(k) && v) pushed[v.nameWithOwner.toLowerCase()] = DateTime.fromISO(v.pushedAt);\nconst date = s => { const dt = s ? DateTime.fromISO(String(s), { zone: tz }) : null; return dt && dt.isValid ? dt : null; };\nconst days = dt => dt ? now.diff(dt, 'days').days : null;\n\nconst issuesByRepo = {};\nfor (const i of gh?.search?.nodes || []) {\n  const full = i?.repository?.nameWithOwner?.toLowerCase();\n  if (!full) continue;\n  (issuesByRepo[full] ||= []).push({ number: i.number, title: i.title, pr: i.__typename === 'PullRequest' });\n}\n\nconst fmt = dt => dt ? dt.toFormat('yyyy-MM-dd') : '-';\nconst blocks = rows.map(r => {\n  const repo = String(r.repo || '').trim().toLowerCase();\n  const act = [pushed[repo], date(r.last_checkin)].filter(Boolean).sort((a, b) => b - a)[0] || null;\n  const open = issuesByRepo[repo] || [];\n  const block = date(r.next_block);\n  return [\n    `### ${r.name} [${r.key}]`,\n    `Status: ${r.status} | Priority: ${r.priority || 'Medium'} | Group: ${r.group || '-'} | Repo: ${repo || 'none'}`,\n    `Last activity: ${act ? `${Math.round(days(act))} days ago` : 'unknown'} | Deadline: ${fmt(date(r.deadline))}`,\n    `Next planning session in the calendar: ${block && block > now ? block.setLocale('en').toFormat('ccc yyyy-MM-dd HH:mm') : 'none planned'}`,\n    `Waiting for: ${r.waiting_for || '-'}${date(r.waiting_since) ? ` (since ${fmt(date(r.waiting_since))})` : ''}`,\n    `Next step: ${r.next_step || '-'}`,\n    `Description: ${r.description || '-'}`,\n    `Open issues/PRs: ${open.length ? open.slice(0, 15).map(i => `#${i.number}${i.pr ? ' (PR)' : ''} ${i.title}`).join('; ') : 'none'}`,\n  ].join('\\n');\n});\nif (!gh) blocks.push('Note: GitHub was unreachable just now; issues and latest pushes are missing.');\nreturn [{ json: {\n  context: blocks.join('\\n\\n') || 'No projects found.',\n  rows: Object.fromEntries(rows.map(r => [r.key, { status: r.status || '', waiting_for: r.waiting_for || '',\n    waiting_since: r.waiting_since || '', next_step: r.next_step || '' }])),\n} }];"
+      },
+      "id": "a9f57538-0abe-4952-99a9-c15a1ffe7331",
+      "name": "Build context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1712,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Only me').first().json.replyTo ? 'This is my reply to your message: \"' + $('Only me').first().json.replyTo + '\"\\n\\nMy reply: ' : '' }}{{ $('Only me').first().json.text }}",
+        "options": {
+          "systemMessage": "=You are my personal project manager. I am a software developer and look after several software projects, each in its own GitHub repo. You talk to me through Telegram.\n\nToday is {{ $now.setZone($('Config').first().json.TIMEZONE).toFormat('cccc, yyyy-MM-dd, HH:mm') }}.\n\nCurrent state of all projects (from the project list and GitHub):\n{{ $('Build context').first().json.context }}\n\nRules:\n- Reply in English, informally, briefly and specifically. No Markdown except simple lists with \"-\".\n- Rely on the data above. If something is missing or unclear, say so instead of guessing.\n- Help me prioritise: when I ask what is coming up, name a few specific next steps instead of a long list.\n- You cannot answer questions that need knowledge of the code. Say then that this is a case for Claude Code: \"/work <key>\" lets Claude implement the oldest startable issue of a project.\n- I add existing repos as projects with \"/connect\"; you cannot do that.\n- If my message changes the state of a project (something is done, I am waiting for someone, the next step changes, a project is paused or activated), append this block at the VERY END of your reply:\n<update>[{\"key\": \"…\", \"status\": \"Active|Waiting|Paused|Someday|Done\", \"waiting_for\": \"…\", \"next_step\": \"…\"}]</update>\n  Per project, give only the fields that change. Set \"waiting_for\" to \"\" when you are no longer waiting for anything.\n  Every reply from me to one of your questions counts as a check-in: output at least [{\"key\": \"…\"}] then.\n- Never mention the block in the visible text."
+        }
+      },
+      "id": "277ee28a-0f7b-4a19-8646-719f2cd86195",
+      "name": "CodeBot agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1936,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Only me').first().json.chatId }}",
+        "contextWindowLength": 20
+      },
+      "id": "f95d567a-2557-4673-b77e-403fde031f73",
+      "name": "Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        2080,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $input.first().json.output || '';\nconst m = out.match(/<update>([\\s\\S]*?)<\\/update>/);\nlet updates = [];\nif (m) { try { updates = JSON.parse(m[1]); } catch (e) { updates = []; } }\nconst reply = out.replace(/<update>[\\s\\S]*?<\\/update>/g, '').trim() || 'Noted.';\nreturn [{ json: { reply: reply.slice(0, 4000), updates: Array.isArray(updates) ? updates : [] } }];"
+      },
+      "id": "1e64ecd3-3c30-493e-9deb-4977b76353bc",
+      "name": "Parse reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Only me').first().json.chatId }}",
+        "text": "={{ String($json.reply).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "f7ef5e22-0ad4-4b0e-8e05-15fd46b50882",
+      "name": "Telegram: Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2512,
+        0
+      ],
+      "webhookId": "fabf6738-2e0f-45bf-bf76-b82d58fe68f3",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram CodeBot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per project to update, with the complete new values of the five fields\nconst { updates } = $('Parse reply').first().json;\nconst rows = $('Build context').first().json.rows;\nconst today = DateTime.now().setZone($('Config').first().json.TIMEZONE).toISODate();\nconst allowed = ['Active', 'Waiting', 'Paused', 'Someday', 'Done'];\n\nconst items = [];\nfor (const u of updates) {\n  const cur = rows[u.key];\n  if (!cur) continue;\n  const out = { key: u.key, ...cur, last_checkin: today };\n  if (u.status && allowed.includes(u.status)) {\n    out.status = u.status;\n    if (u.status === 'Waiting' && cur.status !== 'Waiting') out.waiting_since = today;\n  }\n  if ('waiting_for' in u) {\n    out.waiting_for = String(u.waiting_for || '').slice(0, 1900);\n    if (!u.waiting_for) out.waiting_since = '';\n  }\n  if (u.next_step) out.next_step = String(u.next_step).slice(0, 1900);\n  items.push({ json: out });\n}\nreturn items;"
+      },
+      "id": "502ef969-e062-4a95-a93a-9c810fe699df",
+      "name": "Prepare updates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2736,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1952,
+        224
+      ],
+      "id": "16ed3886-ddf6-4b95-b7b7-a5304be2a2c5",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "GEMINI_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "2324f2ac-b2a4-4f44-a606-28bd2f883c1e",
+      "name": "From router",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        368,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "bb0a936e-8393-48c8-8448-92b8b3f3e157",
+      "name": "Projects",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        0
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Query GitHub only for the repos in codebot_projects (no account-wide search)\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key);\nconst repos = [...new Set(rows.map(r => String(r.repo || '').trim()).filter(r => /^[\\w.-]+\\/[\\w.-]+$/.test(r)))];\nif (!repos.length) return [{ json: { query: 'query { viewer { login } }', repos } }];\nconst repoParts = repos.map((r, i) => {\n  const [o, n] = r.split('/');\n  return `  r${i}: repository(owner: \"${o}\", name: \"${n}\") { nameWithOwner pushedAt }`;\n});\nconst q = `is:open archived:false ${repos.map(r => 'repo:' + r).join(' ')}`;\nconst query = `query {\n${repoParts.join('\\n')}\n  search(type: ISSUE, first: 100, query: \"${q}\") {\n    nodes {\n      ... on Issue { __typename number title updatedAt repository { nameWithOwner } }\n      ... on PullRequest { __typename number title url updatedAt repository { nameWithOwner } }\n    }\n  }\n}`;\nreturn [{ json: { query, repos } }];"
+      },
+      "id": "10f938de-2569-43eb-a16d-13674c97c7ee",
+      "name": "Build GitHub query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "={{ $json.query }}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "811121b1-7ed9-4c5f-8623-f24b884433ef",
+      "name": "GitHub",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        1488,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "key",
+              "condition": "eq",
+              "keyValue": "={{ $json.key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "={{ $json.status }}",
+            "waiting_for": "={{ $json.waiting_for }}",
+            "waiting_since": "={{ $json.waiting_since }}",
+            "next_step": "={{ $json.next_step }}",
+            "last_checkin": "={{ $json.last_checkin }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "waiting_for",
+              "displayName": "waiting_for",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "waiting_since",
+              "displayName": "waiting_since",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "next_step",
+              "displayName": "next_step",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_checkin",
+              "displayName": "last_checkin",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "703b1452-a31c-4628-8425-a151815005c8",
+      "name": "Update project",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "name": "Settings",
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "f9580fe4-fb61-411f-a188-d3f69cd024cc",
+      "position": [
+        592,
+        16
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Only me",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Only me": {
+      "main": [
+        [
+          {
+            "node": "Projects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build context": {
+      "main": [
+        [
+          {
+            "node": "CodeBot agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CodeBot agent": {
+      "main": [
+        [
+          {
+            "node": "Parse reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse reply": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram: Reply": {
+      "main": [
+        [
+          {
+            "node": "Prepare updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare updates": {
+      "main": [
+        [
+          {
+            "node": "Update project",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "CodeBot agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "CodeBot agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects": {
+      "main": [
+        [
+          {
+            "node": "Build GitHub query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build GitHub query": {
+      "main": [
+        [
+          {
+            "node": "GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub": {
+      "main": [
+        [
+          {
+            "node": "Build context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From router": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "tags": []
+}

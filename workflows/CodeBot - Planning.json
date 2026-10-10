@@ -1,0 +1,634 @@
+{
+  "name": "CodeBot - Planning",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "id": "a17db6e5-6335-40c7-b3d4-be81bc8167de",
+      "name": "Daily at 8:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -448,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "fb255b7e-da76-4f22-9e5d-3946c8920ca8",
+      "name": "From router",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -448,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Three ways in: the daily run, /plan from Telegram, a button under a proposal.\n// Button data: s|<e schedule, a another slot, x skip>|<key>|<start in minutes since 1970>\nconst u = $input.first().json.update;\nif (!u) return [{ json: { mode: 'run' } }];\nconst cq = u.callback_query;\nif (!cq) return [{ json: { mode: 'plan' } }];\nconst m = String(cq.data || '').match(/^s\\|([eax])\\|([^|]+)\\|(\\d+)$/);\nif (!m) return [];\nreturn [{ json: { mode: 'callback', action: m[1], key: m[2], startMin: Number(m[3]),\n  queryId: cq.id, chatId: cq.message.chat.id, messageId: cq.message.message_id } }];"
+      },
+      "id": "5ec25c2c-bde6-48e5-92a7-07a85cf84e4f",
+      "name": "Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Values from the data table codebot_settings\nconst setting = (k, fallback) => {\n  const v = String($input.all().map(i => i.json).find(r => r.key === k)?.value ?? '').trim() || fallback;\n  if (!v) throw new Error(`${k} is missing in codebot_settings`);\n  return v;\n};\nconst timezone = setting('timezone');\nif (!DateTime.now().setZone(timezone).isValid) throw new Error(`timezone in codebot_settings is not a valid IANA time zone: ${timezone}`);\n// ==== ADJUST HERE ====\nreturn [{ json: {\n  CHAT_ID: setting('telegram_chat_id'),\n  CALENDAR_ID: setting('calendar_id'),   // the events are created here\n  TIMEZONE: timezone,\n  // Busy is whatever is in any of your Google calendars. List calendars here (ID or name)\n  // that should not count as busy, e.g. a shared calendar.\n  IGNORE_CALENDARS: [],\n\n  // When a planning session may take place: any number of time windows [from, to] per weekday.\n  // The session lies entirely within the window. An empty list means: never on that day.\n  PLANNING_TIMES: {\n    mon: [['19:00', '21:30']],\n    tue: [['19:00', '21:30']],\n    wed: [['19:00', '21:30']],\n    thu: [['19:00', '21:30']],\n    fri: [['19:00', '21:30']],\n    sat: [],\n    sun: [],\n  },\n  PLANNING_MINUTES: 60,                 // length of a planning session\n  GRID_MINUTES: 30,                     // possible start times within the window: every 30 minutes\n  HORIZON_DAYS: 14,                     // how far ahead a slot is proposed\n  LEAD_HOURS: 2,                        // at the earliest this many hours from now\n  SESSION_LOOKAHEAD_DAYS: 90,           // how far ahead an already scheduled planning session counts; then there is no proposal\n\n  STATUS: ['Active', 'Waiting'],        // only projects with this status get proposals\n  // If there is no open ticket with this label, the project needs planning\n  READY_LABEL: setting('ready_label', 'ready-for-agent'),\n\n  REPROPOSE_DAYS: 3,                    // the daily run proposes for the same project again after this many days at the earliest\n  SKIP_DAYS: 7,                         // after “Skip”, this many days of quiet; /plan always proposes\n}}];"
+      },
+      "id": "2ea7a45f-9631-484d-beb8-1d65169ed8e7",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_settings"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "099cd6ee-31f2-4fa0-98f2-468c1c273e65",
+      "name": "Settings",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per calendar from the calendar list of the Google account, without those in IGNORE_CALENDARS.\n// Your own calendar (CALENDAR_ID) is always included, even if the list was not readable.\nconst cfg = $('Config').first().json;\nconst r = $input.first().json;\nconst own = String(cfg.CALENDAR_ID ?? '').trim();\nconst ignored = new Set((cfg.IGNORE_CALENDARS || []).map(s => String(s).trim()));\nconst list = r.statusCode === 200 ? (r.body?.items || []) : null;\nconst cals = (list || []).filter(c => !c.deleted && c.id !== own && !ignored.has(c.id) && !ignored.has(c.summaryOverride || c.summary))\n  .map(c => ({ calendarId: c.id, name: c.summaryOverride || c.summary || c.id }));\ncals.unshift({ calendarId: own, name: 'own calendar' });\nconst listError = list ? '' : `HTTP ${r.statusCode ?? '?'}`;\nreturn cals.map(c => ({ json: { ...c, listError } }));"
+      },
+      "id": "3b29f7df-f87f-4923-ab50-4b2a6ad8b694",
+      "name": "Select calendars",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent($json.calendarId) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "2500"
+            },
+            {
+              "name": "timeZone",
+              "value": "={{ $('Config').first().json.TIMEZONE }}"
+            },
+            {
+              "name": "timeMin",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $now.plus({ days: $('Config').first().json.HORIZON_DAYS + 1 }).toISO() }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "8ead193a-7c56-4517-b862-f52f779c9c96",
+      "name": "Calendar: Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(String($('Config').first().json.CALENDAR_ID ?? '').trim()) + '/events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "2500"
+            },
+            {
+              "name": "timeZone",
+              "value": "={{ $('Config').first().json.TIMEZONE }}"
+            },
+            {
+              "name": "timeMin",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $now.plus({ days: $('Config').first().json.SESSION_LOOKAHEAD_DAYS }).toISO() }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "17587ec6-23d8-4ac5-8011-26300fc12656",
+      "name": "Calendar: Sessions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar account 2"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "codebot_projects"
+        },
+        "matchType": "anyCondition",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "c2369e8b-e845-4af8-9a18-6a170cfbb3a7",
+      "name": "Projects",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1344,
+        0
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Per repo in codebot_projects: number of open tickets with READY_LABEL\nconst cfg = $('Config').first().json;\nconst rows = $('Projects').all().map(i => i.json).filter(r => r.key && cfg.STATUS.includes(r.status));\nconst repos = [...new Set(rows.map(r => String(r.repo || '').trim()).filter(r => /^[\\w.-]+\\/[\\w.-]+$/.test(r)))];\nif (!repos.length) return [{ json: { query: 'query { viewer { login } }', repos } }];\nconst parts = repos.map((r, i) => {\n  const [o, n] = r.split('/');\n  return `  r${i}: repository(owner: \"${o}\", name: \"${n}\") { nameWithOwner ready: issues(states: OPEN, labels: [\"${cfg.READY_LABEL}\"]) { totalCount } }`;\n});\nreturn [{ json: { query: `query {\\n${parts.join('\\n')}\\n}`, repos } }];"
+      },
+      "id": "8bb88185-cc60-4ae7-ad81-d5c97696a448",
+      "name": "Build GitHub query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "endpoint": "https://api.github.com/graphql",
+        "query": "={{ $json.query }}",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-codebot"
+            }
+          ]
+        }
+      },
+      "id": "bd625d43-2c52-4e3d-8d1c-72970ab188c7",
+      "name": "GitHub",
+      "type": "n8n-nodes-base.graphql",
+      "typeVersion": 1.1,
+      "position": [
+        1792,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Returns Telegram calls (kind: 'tg') and at most one calendar event (kind: 'event').\nconst cfg = $('Config').first().json;\nconst inp = $('Input').first().json;\nconst tz = cfg.TIMEZONE;\nconst now = DateTime.now().setZone(tz);\nconst token = $('Settings').all().map(i => i.json).find(r => r.key === 'telegram_bot_token')?.value;\nif (!token) throw new Error('telegram_bot_token is missing in codebot_settings');\nconst api = m => `https://api.telegram.org/bot${String(token).trim()}/${m}`;\nconst tg = (method, payload) => ({ json: { kind: 'tg', url: api(method), payload } });\nconst info = text => tg('sendMessage', { chat_id: cfg.CHAT_ID, text, link_preview_options: { is_disabled: true } });\nconst sd = $getWorkflowStaticData('global');\nsd.pause = sd.pause || {};\n\n// --- Calendars (all of the Google account): busy times and days with a planning session\n// One response per calendar, in the order of Select calendars. Your own calendar must be readable, the others need not be.\nconst selected = $('Select calendars').all().map(i => i.json);\nconst calItems = [], unreadable = [];\nlet calError = !String(cfg.CALENDAR_ID ?? '').trim() ? 'CALENDAR_ID is missing in Config' : '';\n$('Calendar: Events').all().map(i => i.json).forEach((r, i) => {\n  const c = selected[i] || {};\n  if (r.statusCode === 200) calItems.push(...(r.body?.items || []));\n  else if (i === 0) calError = calError || `HTTP ${r.statusCode ?? '?'}${r.body?.error?.message ? ': ' + r.body.error.message : ''}`;\n  else unreadable.push(c.name || c.calendarId);\n});\nconst listError = selected[0]?.listError || '';\nconst events = calItems.filter(e => e.id && e.status !== 'cancelled');\n// If the event was edited in Google, the description comes back as HTML: the key then ends before the next tag\nconst eventKey = e => (String(e.description || '').match(/codebot-key:(?:\\s|&nbsp;)*([^\\s<&]+)/) || [])[1] || '';\nconst busy = [];\nfor (const e of events) {\n  if (e.transparency === 'transparent') continue;\n  if (e.start?.dateTime) busy.push([DateTime.fromISO(e.start.dateTime), DateTime.fromISO(e.end.dateTime)]);\n  else if (e.start?.date) busy.push([DateTime.fromISO(e.start.date, { zone: tz }), DateTime.fromISO(e.end.date, { zone: tz })]);\n}\nconst sessions = events.filter(e => eventKey(e).startsWith('codebot-plan:') && e.start?.dateTime);\nconst sessionDays = new Set(sessions.map(e => DateTime.fromISO(e.start.dateTime).setZone(tz).toISODate()));\n\n// --- Repos with a future planning session: Calendar: Sessions reads your own calendar further ahead than the horizon\nconst sr = $('Calendar: Sessions').first().json;\nif (sr.statusCode !== 200) calError = calError || `HTTP ${sr.statusCode ?? '?'}${sr.body?.error?.message ? ': ' + sr.body.error.message : ''}`;\nconst ahead = (sr.body?.items || []).filter(e => e.id && e.status !== 'cancelled' && eventKey(e).startsWith('codebot-plan:') && e.start?.dateTime);\nconst planned = new Set([...sessions, ...ahead].filter(e => DateTime.fromISO(e.start.dateTime) > now).map(e => eventKey(e).slice('codebot-plan:'.length).toLowerCase()));\n\n// --- Projects and their need for planning\nconst all = $('Projects').all().map(i => i.json).filter(r => r.key)\n  .map(r => ({ key: String(r.key), name: r.name || r.key, status: r.status, prio: r.priority || 'Medium', repo: String(r.repo || '').trim() }));\nconst gh = $('GitHub').first().json;\nconst repoData = {};\nfor (const r of Object.values(gh.data || {})) if (r?.nameWithOwner) repoData[r.nameWithOwner.toLowerCase()] = r;\nconst need = p => {\n  const r = repoData[p.repo.toLowerCase()];\n  if (!r) return null;\n  if (!r.ready?.totalCount) return { reason: `no open ticket with ${cfg.READY_LABEL}` };\n  return null;\n};\n\n// --- Free start times in the time windows from PLANNING_TIMES, at most one planning session per day\nconst DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];\nconst hm = s => String(s).split(':').map(Number);\nconst duration = { minutes: cfg.PLANNING_MINUTES };\nconst freeSlots = (taken, skipDays) => {\n  const earliest = now.plus({ hours: cfg.LEAD_HOURS });\n  const out = [];\n  for (let i = 0; i <= cfg.HORIZON_DAYS; i++) {\n    const day = now.startOf('day').plus({ days: i });\n    if (skipDays.has(day.toISODate())) continue;\n    for (const [from, to] of (cfg.PLANNING_TIMES[DAYS[day.weekday - 1]] || [])) {\n      const [sh, sm] = hm(from), [eh, em] = hm(to);\n      const end = day.set({ hour: eh, minute: em });\n      for (let s = day.set({ hour: sh, minute: sm }); s.plus(duration) <= end; s = s.plus({ minutes: cfg.GRID_MINUTES })) {\n        const e = s.plus(duration);\n        if (s < earliest || taken.some(([bs, be]) => bs < e && be > s)) continue;\n        out.push(s);\n      }\n    }\n  }\n  return out;\n};\nconst pick = a => a[Math.floor(Math.random() * a.length)];\nconst fmt = s => `${s.setLocale('en').toFormat('ccc d LLL HH:mm')}–${s.plus(duration).toFormat('HH:mm')}`;\nconst cb = (a, p, s) => `s|${a}|${p.key}|${Math.floor(s.toSeconds() / 60)}`;\nconst bytes = s => encodeURIComponent(s).replace(/%[0-9A-F]{2}/g, 'x').length;\n// The message starts with [key] so that CodeBot - Chat assigns a reply to it to the project\nconst proposal = (p, s, b) => ({\n  text: `[${p.key}] 🧭 Planning session for ${p.name}\\nProposal: ${fmt(s)}\\nReason: ${b.reason}`,\n  link_preview_options: { is_disabled: true },\n  reply_markup: { inline_keyboard: [[\n    { text: '✅ Schedule', callback_data: cb('e', p, s) },\n    { text: '🔀 Another slot', callback_data: cb('a', p, s) },\n    { text: '⏭ Skip', callback_data: cb('x', p, s) } ]] },\n});\n\n// --- Button under a proposal\nif (inp.mode === 'callback') {\n  const ack = (text = '') => tg('answerCallbackQuery', { callback_query_id: inp.queryId, text });\n  const edit = payload => tg('editMessageText', { chat_id: inp.chatId, message_id: inp.messageId, link_preview_options: { is_disabled: true }, ...payload });\n  const p = all.find(x => x.key === inp.key);\n  if (!p) return [ack(), edit({ text: `[${inp.key}] ⚠️ The project is no longer in codebot_projects.` })];\n  if (inp.action === 'x') {\n    sd.pause[p.key] = now.plus({ days: cfg.SKIP_DAYS }).toISO();\n    return [ack(), edit({ text: `[${p.key}] ⏭ Planning session for ${p.name} skipped. Next proposal in ${cfg.SKIP_DAYS} days at the earliest, or with /plan.` })];\n  }\n  if (calError) return [ack('The calendar is not readable right now.')];\n  if (planned.has(p.repo.toLowerCase()))\n    return [ack(), edit({ text: `[${p.key}] ✅ There is already a planning session for ${p.name} in the calendar.` })];\n  const b = need(p) || { reason: 'requested by you' };\n  const start = DateTime.fromSeconds(inp.startMin * 60, { zone: tz });\n  const free = freeSlots(busy, sessionDays);\n  if (inp.action === 'e' && free.some(s => s.toMillis() === start.toMillis())) {\n    return [ack('Scheduling it.'), { json: {\n      kind: 'event', key: p.key, name: p.name, label: fmt(start),\n      start: start.toISO(), end: start.plus(duration).toISO(),\n      summary: `🧭 Planning: ${p.name}`,\n      description: `Create the next tickets with the label ${cfg.READY_LABEL}.\\nhttps://github.com/${p.repo}\\n\\nScheduled by Code-Bot after your confirmation. Feel free to move or delete it at any time.\\ncodebot-key: codebot-plan:${p.repo}`,\n      editUrl: api('editMessageText'), chatId: inp.chatId, messageId: inp.messageId,\n    } }];\n  }\n  // Another slot was requested, or the proposed one is no longer free\n  const others = free.filter(s => s.toMillis() !== start.toMillis());\n  if (!others.length) return [ack(`No other free slot in the next ${cfg.HORIZON_DAYS} days.`)];\n  return [ack(inp.action === 'e' ? 'That slot is no longer free. Here is another one.' : ''), edit(proposal(p, pick(others), b))];\n}\n\n// --- Daily run and /plan: one proposal per project that needs planning and has no future planning session\nif (calError) return [info(`⚠️ Planning: your own calendar could not be read (${calError}).`)];\nconst prio = { High: 3, Medium: 2, Low: 1 };\nconst projects = all.filter(p => cfg.STATUS.includes(p.status) && /^[\\w.-]+\\/[\\w.-]+$/.test(p.repo))\n  .sort((a, b) => (prio[b.prio] || 0) - (prio[a.prio] || 0));\nconst out = [], taken = [...busy], usedDays = new Set(sessionDays), noSlot = [], noRepo = [], tooLong = [];\nfor (const p of projects) {\n  if (planned.has(p.repo.toLowerCase())) continue;\n  if (!repoData[p.repo.toLowerCase()]) { noRepo.push(p.key); continue; }\n  const b = need(p);\n  if (!b) continue;\n  if (inp.mode === 'run' && sd.pause[p.key] && DateTime.fromISO(sd.pause[p.key]) > now) continue;\n  const free = freeSlots(taken, usedDays);\n  if (!free.length) { noSlot.push(p.key); continue; }\n  const s = pick(free);\n  if (bytes(cb('e', p, s)) > 64) { tooLong.push(p.key); continue; }\n  taken.push([s, s.plus(duration)]);\n  usedDays.add(s.toISODate());\n  out.push(tg('sendMessage', { chat_id: cfg.CHAT_ID, ...proposal(p, s, b) }));\n  sd.pause[p.key] = now.plus({ days: cfg.REPROPOSE_DAYS }).toISO();\n}\nconst notes = [];\nif (noSlot.length) notes.push(`No free slot in the next ${cfg.HORIZON_DAYS} days for: ${noSlot.join(', ')}`);\nif (noRepo.length) notes.push(`GitHub returned no data for: ${noRepo.join(', ')} (check the repo in codebot_projects)`);\nif (tooLong.length) notes.push(`Key too long for buttons: ${tooLong.join(', ')}`);\nif (out.length && listError) notes.push(`The calendar list was not readable (${listError}); only your own calendar was checked`);\nif (out.length && unreadable.length) notes.push(`Unreadable calendars, not checked for overlaps there: ${unreadable.join(', ')}`);\nif (notes.length) out.push(info(`⚠️ Planning\\n${notes.join('\\n')}`));\nif (inp.mode === 'plan' && !out.length) out.push(info('🧭 No project needs a planning session right now.'));\nreturn out;"
+      },
+      "id": "ff402c37-08a4-436f-85d5-8e412d7472fd",
+      "name": "Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'tg');"
+      },
+      "id": "061dafda-f57f-400d-ab6d-8611a66a1185",
+      "name": "Telegram only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => i.json.kind === 'event');"
+      },
+      "id": "b85c64cc-6510-4f65-ba71-7eee2fcbc4ce",
+      "name": "Event only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.CALENDAR_ID }}",
+          "mode": "id"
+        },
+        "start": "={{ $json.start }}",
+        "end": "={{ $json.end }}",
+        "additionalFields": {
+          "allday": "no",
+          "description": "={{ $json.description }}",
+          "showMeAs": "opaque",
+          "summary": "={{ $json.summary }}"
+        }
+      },
+      "id": "68aa712d-71e8-4960-a71c-9e5a2ab430fd",
+      "name": "Calendar: Create event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        2464,
+        96
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The message with the proposal then shows the result; the buttons disappear\nconst t = $('Event only').first().json;\nconst error = $input.first().json.error;\nif (!error) delete ($getWorkflowStaticData('global').pause || {})[t.key];\nconst text = error\n  ? `[${t.key}] ⚠️ The planning session for ${t.name} could not be scheduled: ${typeof error === 'string' ? error : error.message || 'error'}`\n  : `[${t.key}] ✅ Planning session for ${t.name} scheduled: ${t.label}`;\nreturn [{ json: { kind: 'tg', url: t.editUrl, payload: { chat_id: t.chatId, message_id: t.messageId, text, link_preview_options: { is_disabled: true } } } }];"
+      },
+      "id": "a7441d15-3538-4497-8072-27d43b075027",
+      "name": "Report event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "f9907419-2710-4cd0-8cc7-101cd903db1c",
+      "name": "Telegram: Send",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2912,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "maxResults",
+              "value": "250"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "dcebaf65-9688-4497-8a60-1c82565e3615",
+      "name": "Calendar: List",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        0
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CALENDAR_CREDENTIAL_ID",
+          "name": "Google Calendar account 2"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Daily at 8:00": {
+      "main": [
+        [
+          {
+            "node": "Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From router": {
+      "main": [
+        [
+          {
+            "node": "Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select calendars": {
+      "main": [
+        [
+          {
+            "node": "Calendar: Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar: Events": {
+      "main": [
+        [
+          {
+            "node": "Calendar: Sessions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects": {
+      "main": [
+        [
+          {
+            "node": "Build GitHub query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build GitHub query": {
+      "main": [
+        [
+          {
+            "node": "GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub": {
+      "main": [
+        [
+          {
+            "node": "Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan": {
+      "main": [
+        [
+          {
+            "node": "Telegram only",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Event only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram only": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event only": {
+      "main": [
+        [
+          {
+            "node": "Calendar: Create event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar: Create event": {
+      "main": [
+        [
+          {
+            "node": "Report event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report event": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar: List": {
+      "main": [
+        [
+          {
+            "node": "Select calendars",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar: Sessions": {
+      "main": [
+        [
+          {
+            "node": "Projects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Calendar: List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "pinData": {}
+}
